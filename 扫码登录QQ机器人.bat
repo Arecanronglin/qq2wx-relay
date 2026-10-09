@@ -3,6 +3,8 @@ chcp 65001 >nul
 title QQ Bot Login Helper
 cd /d "%~dp0"
 
+REM  <- change BOT_UIN to your bot QQ number (only used in the hint text below)
+REM  <- change NAPCAT_DIR if you installed NapCat somewhere else
 set BOT_UIN=123456789
 set NAPCAT_DIR=D:\NapCat
 set WEBUI=http://127.0.0.1:6099

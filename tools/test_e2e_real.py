@@ -75,8 +75,19 @@ class RecordingSender(Sender):
 
 
 def main() -> int:
-    group_id = int(sys.argv[1]) if len(sys.argv) > 1 else 111222333
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 40
+
+    # 群号不硬编码：优先用命令行参数，否则取 config.yaml 里第一个监听群。
+    # （这样别人 clone 下来不用改代码就能跑，也不会把真实群号写进仓库。）
+    if len(sys.argv) > 1:
+        group_id = int(sys.argv[1])
+    else:
+        try:
+            group_id = next(iter(AppConfig.load("config.yaml").qq_groups))
+        except Exception:  # noqa: BLE001
+            print("[x] 没给命令行群号，也从 config.yaml 的 qq_groups 里读不到。")
+            print("    用法：python tools\\test_e2e_real.py <群号> [条数]")
+            return 2
 
     print("=" * 74)
     print("真实数据端到端测试（NapCat 真实消息 -> 完整 Pipeline）")
