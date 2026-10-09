@@ -21,6 +21,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,51 +75,136 @@ class RecordingSender(Sender):
         pass
 
 
-def main() -> int:
-    count = int(sys.argv[2]) if len(sys.argv) > 2 else 40
-
-    # 群号不硬编码：优先用命令行参数，否则取 config.yaml 里第一个监听群。
-    # （这样别人 clone 下来不用改代码就能跑，也不会把真实群号写进仓库。）
-    if len(sys.argv) > 1:
-        group_id = int(sys.argv[1])
-    else:
+def _load_events(path: Path) -> list[dict]:
+    """从 JSONL 读 OneBot 事件（离线回放用）。坏行跳过，不中断。"""
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            group_id = next(iter(AppConfig.load("config.yaml").qq_groups))
-        except Exception:  # noqa: BLE001
-            print("[x] 没给命令行群号，也从 config.yaml 的 qq_groups 里读不到。")
-            print("    用法：python tools\\test_e2e_real.py <群号> [条数]")
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _usage() -> None:
+    print("用法：")
+    print("  在线：python tools\\test_e2e_real.py [群号] [条数]")
+    print("  离线：python tools\\test_e2e_real.py --from-file samples\\events.sample.jsonl")
+
+
+def main() -> int:
+    argv = list(sys.argv[1:])
+
+    # --from-file：离线回放模式，不需要 NapCat。
+    # （没登录 / CI 环境 / 别人 clone 下来没有真实群时也能跑完这套测试。）
+    from_file = None
+    if "--from-file" in argv:
+        i = argv.index("--from-file")
+        if i + 1 >= len(argv):
+            print("[x] --from-file 后面要跟一个 JSONL 文件路径")
+            _usage()
+            return 2
+        from_file = Path(argv[i + 1])
+        del argv[i:i + 2]
+
+    cfg = AppConfig.load("config.yaml")
+    count = int(argv[1]) if len(argv) > 1 else 40
+
+    print("=" * 74)
+    if from_file:
+        print("离线端到端测试（OneBot JSONL 回放 -> 完整 Pipeline）")
+    else:
+        print("真实数据端到端测试（NapCat 真实消息 -> 完整 Pipeline）")
+    print("=" * 74)
+
+    if from_file:
+        # ------------------------------ 离线回放 ------------------------------
+        if not from_file.is_file():
+            print(f"[x] 文件不存在：{from_file}")
+            return 2
+        events = _load_events(from_file)
+        raw_msgs = [e for e in events if e.get("post_type") == "message"]
+        if not raw_msgs:
+            print(f"[x] {from_file} 里没有 post_type=message 的事件")
+            return 2
+        self_id = next((e.get("self_id") for e in events if e.get("self_id")), "")
+        info = {"user_id": self_id, "nickname": "(离线回放)"}
+
+        # 主群 = 消息最多的那个群。样本里其他的群是"不该被监听"的**负例**，
+        # 不能一起塞进白名单，否则过滤逻辑就测不到了。
+        tally: dict = {}
+        for m in raw_msgs:
+            g = m.get("group_id")
+            if g:
+                tally[g] = tally.get(g, 0) + 1
+        if not tally:
+            print("[x] 事件里没有 group_id，无法确定要监听的群")
+            return 2
+        primary = max(tally, key=lambda g: tally[g])
+        names = {primary: f"离线示例群{primary}"}
+        cfg.qq_groups = {primary: ["离线目标群"]}
+
+        # 只保留主群，并按 message_id 去重。
+        # 「非监听群被忽略」和「重复消息被去掉」由 7-离线自检 专门覆盖，
+        # 这里先排除掉，好让「解析出的消息全都发出去」这条强断言成立。
+        seen: set = set()
+        replay: list = []
+        for m in raw_msgs:
+            if m.get("group_id") != primary:
+                continue
+            mid = m.get("message_id")
+            if mid is not None:
+                if mid in seen:
+                    continue
+                seen.add(mid)
+            replay.append(m)
+        excluded = len(raw_msgs) - len(replay)
+        raw_msgs = replay
+
+        print(f"\n1. 回放事件")
+        print(f"  文件 {from_file}")
+        print(f"  主群 {primary}（另有 {len(tally) - 1} 个群是负例，已排除）")
+        print(f"  取用 {len(raw_msgs)} 条消息（另排除 {excluded} 条：非监听群或重复）")
+    else:
+        # ------------------------------ 在线拉取 ------------------------------
+        if argv:
+            group_id = int(argv[0])
+        elif cfg.qq_groups:
+            group_id = next(iter(cfg.qq_groups))
+        else:
+            print("[x] 没给群号，config.yaml 的 qq_groups 也是空的。")
+            _usage()
+            return 2
+        print(f"群号 {group_id}，取最近 {count} 条")
+
+        http = OneBotHttpClient("http://127.0.0.1:3000")
+        try:
+            info = http.call("get_login_info")
+            print(f"\nNapCat 已连接：{info.get('nickname')}（{info.get('user_id')}）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n[x] 连不上 NapCat：{exc}")
+            print("    NapCat 没在运行时可以改用离线回放：")
+            print("      python tools\\test_e2e_real.py --from-file samples\\events.sample.jsonl")
             return 2
 
-    print("=" * 74)
-    print("真实数据端到端测试（NapCat 真实消息 -> 完整 Pipeline）")
-    print(f"群号 {group_id}，取最近 {count} 条")
-    print("=" * 74)
-
-    http = OneBotHttpClient("http://127.0.0.1:3000")
-    try:
-        info = http.call("get_login_info")
-        print(f"\nNapCat 已连接：{info.get('nickname')}（{info.get('user_id')}）")
-    except Exception as exc:  # noqa: BLE001
-        print(f"\n[x] 连不上 NapCat：{exc}")
-        print("    NapCat 没在运行的话，这个测试无法进行。")
-        return 2
-
-    # ---- 取真实消息
-    print("\n1. 拉取真实群消息")
-    try:
-        data = http.call("get_group_msg_history", {"group_id": group_id, "count": count})
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [x] 拉取失败：{exc}")
-        return 2
-    raw_msgs = (data or {}).get("messages") if isinstance(data, dict) else data
-    if not raw_msgs:
-        print("  [x] 没取到消息")
-        return 2
-    print(f"  [OK] 取到 {len(raw_msgs)} 条真实消息")
+        print("\n1. 拉取真实群消息")
+        try:
+            data = http.call("get_group_msg_history", {"group_id": group_id, "count": count})
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [x] 拉取失败：{exc}")
+            return 2
+        raw_msgs = (data or {}).get("messages") if isinstance(data, dict) else data
+        if not raw_msgs:
+            print("  [x] 没取到消息")
+            return 2
+        print(f"  [OK] 取到 {len(raw_msgs)} 条真实消息")
+        names = http.group_list()
 
     tmp = Path(tempfile.mkdtemp(prefix="qq2wx_e2e_"))
     try:
-        cfg = AppConfig.load("config.yaml")
         out = tmp / "run"
         cfg.logging.archive_dir = str(out / "archive")
         cfg.media.dir = str(out / "media")
@@ -141,7 +227,6 @@ def main() -> int:
 
         # ---- 用生产解析函数转换
         print("\n2. 生产解析（payload_to_message）")
-        names = http.group_list()
         parsed = []
         now = time.time()
         for m in raw_msgs:
@@ -205,13 +290,19 @@ def main() -> int:
         expect_media = sum(len(x.media) for x in parsed)
         print(f"       真实消息里共 {expect_media} 个媒体")
         if expect_media:
-            check(bool(s.files), f"成功转发 {len(s.files)} 个媒体",
-                  f"预期最多 {min(expect_media, cfg.media.max_per_batch)} 个（有每批上限）")
-            for _, fname, _ in s.files:
-                check(bool(Path(fname).suffix and Path(fname).suffix != ".bin"),
-                      f"媒体 {fname[:30]} 扩展名正常", fname)
-            # 文字必须在文件之前
-            check(True, "文字在文件之前发出（Pipeline 保证顺序）")
+            if s.files:
+                check(True, f"成功转发 {len(s.files)} 个媒体",
+                      f"预期最多 {min(expect_media, cfg.media.max_per_batch)} 个（有每批上限）")
+                for _, fname, _ in s.files:
+                    check(bool(Path(fname).suffix and Path(fname).suffix != ".bin"),
+                          f"媒体 {fname[:30]} 扩展名正常", fname)
+                check(True, "文字在文件之前发出（Pipeline 保证顺序）")
+            elif from_file:
+                skip("媒体转发",
+                     "离线样本里的媒体 URL 不可达，下载必然失败（真实媒体转发由在线模式验证）")
+            else:
+                check(False, "成功转发 0 个媒体",
+                      f"预期最多 {min(expect_media, cfg.media.max_per_batch)} 个（有每批上限）")
         else:
             skip("媒体转发", "这批消息里没有图片/文件")
 
