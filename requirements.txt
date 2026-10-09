@@ -1,0 +1,10 @@
+# ---- QQ 侧（必装）----
+# OneBot 11 正向 WebSocket 客户端
+websockets>=12.0
+
+# 配置文件解析（可选；不装则只支持 JSON 配置）
+PyYAML>=6.0
+
+# ---- 微信侧（必装，仅 Windows）----
+# 微信 4.x 自动化（UIA，不注入不 hook）
+wx4py>=0.2.1

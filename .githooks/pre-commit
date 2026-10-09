@@ -1,0 +1,32 @@
+#!/bin/sh
+# 提交前敏感信息扫描 —— 防止把真实凭据 / 个人信息 / 聊天记录提进仓库。
+#
+# 安装（在仓库根目录执行一次）：
+#     git config core.hooksPath .githooks
+#
+# 紧急绕过（不推荐）：
+#     git commit --no-verify
+
+set -e
+
+# 保证 python 输出走 UTF-8，不然 Windows 上 GBK 控制台会把 hook 搞崩
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+PY=""
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+fi
+
+if [ -z "$PY" ]; then
+    echo "check-secrets: 没找到 python，跳过扫描（建议装好 venv 再提交）" >&2
+    exit 0
+fi
+
+exec "$PY" tools/check_secrets.py --staged

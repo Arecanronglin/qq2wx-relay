@@ -1,0 +1,121 @@
+# ============================================================
+#  QQ群 -> 微信群  消息桥接配置
+#  用法：复制本文件为 config.yaml，改完再运行
+# ============================================================
+
+qq:
+  # NapCat 的 OneBot 11 正向 WebSocket 地址。
+  # NapCat 面板里「网络配置」新建一个 WebSocket 服务器，端口与此一致。
+  ws_url: "ws://127.0.0.1:3001"
+
+  # 连接用的 access_token，NapCat 没设就留空
+  access_token: ""
+
+  # NapCat 的 HTTP 服务地址，用于主动调用接口（取群名、回发消息等）
+  http_url: "http://127.0.0.1:3000"
+
+  # 登录 QQ 的号，留空则自动识别
+  self_id: 0
+
+# ---------- 要转发的 QQ 群 ----------
+qq_groups:
+  # 群号: 这个群转发到哪些微信群
+  "777888999":
+    - "班团"
+  # 想加更多群，照这个格式往下写
+  # "987654321":
+  #   - "运营群"
+
+# ---------- 微信群发送设置 ----------
+wechat:
+  # 发送通道：
+  #   wx4py   —— 真实发送到微信群（默认，需要微信在前台）
+  #   webhook —— 发到企业微信/钉钉群机器人，最稳但收不到普通微信群
+  #   dry-run —— 只打印不发送，用来先验证链路
+  driver: "dry-run"
+
+  # driver=webhook 时填这里
+  webhook:
+    url: ""
+    # wecom（企业微信 markdown）| dingtalk（钉钉 markdown）| plain（纯文本 JSON {"text": "..."}）
+    kind: "wecom"
+    timeout: 10
+
+  # driver=wx4py 时填这里
+  wx4py:
+    target_type: "group"   # 转发目标是微信群
+    retries: 2             # 发送失败重试次数
+    retry_delay: 3         # 重试间隔（秒）
+    per_message_delay: 1.0 # 每条之间停顿，太快容易失败
+    max_chars: 1800        # 单条微信消息字数上限，超了自动分片
+
+# ---------- 消息整合策略 ----------
+aggregate:
+  # 汇总时间窗（秒）。这个窗口内收到的 QQ 消息合成一条发到微信。
+  #   0    = 收到就立刻发（实时逐条转发，容易刷屏）
+  #   60   = 攒 60 秒发一次（推荐）
+  #   300  = 每 5 分钟发一次
+  window_seconds: 60
+
+  # 每隔多少秒检查一次有没有到期的汇总
+  flush_interval: 5
+
+  # 窗口内消息达到这个条数就立刻发，不等窗口到期。0 = 不限制
+  max_batch_size: 40
+
+  # 静默补发：窗口到期时如果距离最后一条消息还不到这个秒数，就再等一会儿
+  # （让连续对话尽量进同一条汇总）。0 = 关闭
+  quiet_seconds: 0
+
+  # 汇总消息的模板。可用变量：
+  #   {group_name} {group_id} {count} {time} {messages}
+  template: |
+    【QQ群 · {group_name}】{count} 条新消息
+    ---------------- 截至 {time} ----------------
+    {messages}
+
+  # 每条消息在汇总里的模板。可用变量：
+  #   {sender} {content} {time}
+  line_template: "{sender}: {content}"
+
+  # 超长汇总的分片后缀
+  chunk_suffix: "（{index}/{total}）"
+
+# ---------- 过滤 ----------
+filters:
+  # 这些 QQ 号的消息不转发
+  ignore_senders: []
+  #   - "10001"
+
+  # 消息内容命中这些词就不转发
+  ignore_keywords: []
+  #   - "红包"
+  #   - "拼多多"
+
+  # 只转发命中这些词的消息（留空 = 全都要）。填了就变成白名单模式
+  include_keywords: []
+
+  # 以下消息类型是否转发
+  forward_images: true
+  forward_files: true
+  forward_face: false      # QQ 表情
+  forward_at: true         # @某人
+  forward_reply: true      # 引用回复
+  forward_other: true      # 其他未知类型（转发/合并转发等）
+
+  # 忽略 QQ 机器人自己发的消息（避免自己转自己形成回环）
+  ignore_self: true
+
+# ---------- 限流与日志 ----------
+limits:
+  # 每个 QQ 群每天最多往微信发多少条汇总。超了当天不再发。0 = 不限制
+  max_sends_per_day: 200
+  # 两次发送之间的最小间隔（秒），避免风控
+  min_send_interval: 3
+
+logging:
+  level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  # 日志文件（相对路径按项目根目录解析）。留空则只输出到控制台
+  file: "logs/qq2wx.log"
+  # 转发内容留档，方便回溯"发了什么"
+  archive_dir: "logs/archive"
