@@ -7,6 +7,9 @@
     # 采集今天 18:25 之后的消息
     python tools\\dump_group_history.py --group 123456789 --since "18:25"
 
+    # 增量采集：接着上次停的地方继续（日常用这个）
+    python tools\\dump_group_history.py --group 123456789 --since-last
+
     # 跟配置文件里第一个监听群，采集最近 300 条
     python tools\\dump_group_history.py --count 300
 
@@ -335,6 +338,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", type=int, default=None, help="群号，默认取配置里第一个")
     ap.add_argument("--since", default=None, help="起始时间，如 18:25 或 '2026-10-10 18:25'")
+    ap.add_argument("--since-last", action="store_true",
+                    help="增量：接着上次采集的位置继续（状态存 notes/collect-state.json）")
+    ap.add_argument("--state", default=None, help="增量状态文件路径")
     ap.add_argument("--count", type=int, default=200, help="每页条数，默认 200")
     ap.add_argument("--max-pages", type=int, default=10, help="最多翻几页")
     ap.add_argument("--out", default=None, help="输出目录")
@@ -378,15 +384,43 @@ def main() -> int:
         print(f"  [警告] 群名没解析出来（{exc}），文档里就用群号代替")
     print(f"目标群：{group_name}（{group_id}）")
 
-    since = parse_since(args.since) if args.since else 0.0
+    state_path = Path(args.state) if args.state else ROOT / "notes" / "collect-state.json"
+    state: dict = {}
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            state = {}
+
     if args.since:
-        print(f"起始时间：{fmt_time(since)}")
+        since = parse_since(args.since)
+        print(f"起始时间：{fmt_time(since)}（命令行指定）")
+    elif args.since_last:
+        rec = state.get(str(group_id)) or {}
+        last = float(rec.get("last_time") or 0)
+        if last:
+            since = last
+            print(f"起始时间：{fmt_time(since)}"
+                  f"（上次采集于 {rec.get('last_run', '?')}）")
+        else:
+            since = time.time() - 86400
+            print(f"起始时间：{fmt_time(since)}（没有历史位置，默认最近 24 小时）")
+    else:
+        since = 0.0
+        print("起始时间：不限（拉到的全都算）")
 
     # ---- 拉取
     print("\n[1/4] 拉取历史消息")
     msgs = fetch_history(http, group_id, since, args.count, args.max_pages)
+    # 增量模式下，上次采到的那几条（时间戳与边界同秒）按 message_id 精确跳过，
+    # 否则每次都会重复采到边界那条。
+    skip_ids: set = set()
+    if args.since_last:
+        skip_ids = set((state.get(str(group_id)) or {}).get("last_ids") or [])
+
     msgs = [m for m in msgs if m.get("post_type") == "message"
-            and int(m.get("time") or 0) >= since]
+            and int(m.get("time") or 0) >= since
+            and m.get("message_id") not in skip_ids]
     msgs.sort(key=lambda m: int(m.get("time") or 0))
     print(f"  → 符合条件 {len(msgs)} 条")
     if not msgs:
@@ -469,6 +503,25 @@ def main() -> int:
     (out / "SUMMARY.md").write_text(
         render_summary(group_id, group_name, msgs, since, media_files),
         encoding="utf-8")
+
+    # 记下增量位置，下次 --since-last 从这里接着走
+    if msgs:
+        rec = state.setdefault(str(group_id), {})
+        rec["group_name"] = group_name
+        newest = max(int(m.get("time") or 0) for m in msgs)
+        rec["last_time"] = newest
+        # 边界同秒的消息 id 也要记住，否则下次会重复采到
+        rec["last_ids"] = [m.get("message_id") for m in msgs
+                           if int(m.get("time") or 0) == newest]
+        rec["last_count"] = len(msgs)
+        rec["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"增量位置已记录：{fmt_time(rec['last_time'])}")
+        except OSError as exc:
+            print(f"[警告] 增量状态没写成功：{exc}")
 
     print(f"\n完成，产物在：{out}")
     for f in sorted(out.iterdir()):
