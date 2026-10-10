@@ -46,10 +46,12 @@ MEDIA_TYPES = {"image", "file", "video", "record"}
 def iter_media_segments(msgs: list[dict], default_gid: int):
     """遍历**顶层 + 合并转发内部**的所有媒体段。
 
+    产出 (段类型, 段数据, 该用哪个群号取直链, 位置信息 ctx)。
+
     踩过的坑：一开始只看了顶层 message，结果合并转发里的 PPTX / PDF
     全部漏掉 —— 而那恰恰是最重要的那几个文件。
     """
-    def walk(segs, gid):
+    def walk(segs, gid, ctx):
         if not isinstance(segs, list):
             return
         for seg in segs:
@@ -57,21 +59,39 @@ def iter_media_segments(msgs: list[dict], default_gid: int):
                 continue
             t = str(seg.get("type") or "")
             if t in MEDIA_TYPES:
-                yield t, (seg.get("data") or {}), gid
+                yield t, (seg.get("data") or {}), gid, ctx
             elif t == "forward":
                 for sub in (seg.get("_forward") or []):
                     # 合并转发的内容来自**别的群**，子消息自带原 group_id。
                     # 附件直链必须用原群号去问，用本群号会取不到（实测踩过）。
+                    inner = {
+                        "src_group": sub.get("group_id") or gid,
+                        "src_sender": sender_of(sub),
+                        "src_group_name": sub.get("group_name") or "",
+                        "src_time": sub.get("time"),
+                        "outer_group": ctx.get("outer_group"),
+                        "outer_sender": ctx.get("outer_sender"),
+                        "outer_time": ctx.get("outer_time"),
+                    }
                     yield from walk(sub.get("message"),
-                                    sub.get("group_id") or gid)
+                                    sub.get("group_id") or gid, inner)
 
     for m in msgs:
-        yield from walk(m.get("message"), m.get("group_id") or default_gid)
+        gid = m.get("group_id") or default_gid
+        who = sender_of(m)
+        when = m.get("time")
+        ctx = {
+            "src_group": gid, "src_sender": who, "src_time": when,
+            # 顶层媒体没有"转发链"，outer 就是它自己
+            "outer_group": gid, "outer_sender": who, "outer_time": when,
+        }
+        yield from walk(m.get("message"), gid, ctx)
 
 
 def build_media_item(http, seg_type: str, data: dict, gid: int):
-    """把消息段变成可下载的 MediaItem；拿不到地址返回 None。
+    """把消息段变成可下载的 MediaItem。
 
+    返回 (item, 失败原因)。成功时原因是 None。
     群文件的段里**没有 url**，只有 file_id，必须用 OneBot 的
     get_group_file_url 现取直链（直链会过期，所以每次都得现取）。
     """
@@ -94,22 +114,28 @@ def build_media_item(http, seg_type: str, data: dict, gid: int):
         name = raw_file
 
     if not url and seg_type == "file" and file_id:
-        try:
-            res = http.call("get_group_file_url",
-                            {"group_id": gid, "file_id": file_id})
-            url = str(((res or {}).get("data") or {}).get("url") or "")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [x] 取直链失败 {name or file_id}：{exc}")
-            return None
+        # 短时间内连续取直链会被限流：接口不报错但返回**空直链**。
+        # 实测等一会儿再取就好了，所以这里自己重试，别让用户干等。
+        for attempt in range(1, 4):
+            try:
+                res = http.call("get_group_file_url",
+                                {"group_id": gid, "file_id": file_id})
+                url = str(((res or {}).get("data") or {}).get("url") or "")
+            except Exception as exc:  # noqa: BLE001
+                return None, f"取直链被拒：{exc}"
+            if url:
+                break
+            if attempt < 3:
+                print(f"      （{name or file_id} 直链为空，等 15 秒重试 "
+                      f"{attempt}/2）")
+                time.sleep(15)
         if not url:
-            # 不报错但返回空直链：多半是接口限流，或文件已过期/被删。
-            # 早期版本这里静默返回 None，结果"少下了文件却看不出原因"。
-            print(f"  [x] 直链为空：{name or file_id}"
-                  f"（群 {gid}）—— 可能限流或文件已失效")
+            return None, "接口连续返回空直链（多为限流，或文件已失效）"
 
     if not url:
-        return None
-    return MediaItem(kind=seg_type, url=url, filename=name, file_id=file_id)
+        return None, "没有可用的下载地址"
+
+    return MediaItem(kind=seg_type, url=url, filename=name, file_id=file_id), None
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +360,63 @@ def render_summary(group_id: int, group_name: str, msgs: list[dict],
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
+def fmt_clock(ts) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def render_missing(group_id: int, group_name: str, missing: list[dict]) -> str:
+    """把下不来的附件整理成「去哪下」的坐标说明。"""
+    lines = [
+        f"# 下不来的附件 · {group_name}（{group_id}）",
+        "",
+        f"共 **{len(missing)}** 个。机器人取不到直链，但你在 QQ 里点开就能下。",
+        "",
+    ]
+    for i, m in enumerate(missing, 1):
+        size = f"{m['size'] / 1024:.0f} KB" if m.get("size") else "大小未知"
+        cross = bool(m.get("outer_time") and m.get("src_time")
+                     and m.get("outer_group") != m.get("src_group"))
+        lines += [
+            f"## {i}. {m['name']}",
+            "",
+            f"- 大小：{size}",
+            f"- 取不到的原因：{m.get('reason') or '未知'}",
+            "",
+            "**去哪下：**",
+            "",
+        ]
+        if cross:
+            lines += [
+                f"1. 打开群 **{group_id}**（{group_name}）",
+                f"2. 找 **{m.get('outer_sender')}** 在 "
+                f"**{fmt_clock(m.get('outer_time'))}** 发的那条**合并转发**，点开它",
+                f"3. 里面 **{m.get('src_sender')}** 于 "
+                f"**{fmt_clock(m.get('src_time'))}** 发的消息带的就是这个文件",
+                "",
+                f"> 原件在群 **{m.get('src_group')}**"
+                + (f"（{m.get('src_group_name')}）" if m.get("src_group_name") else "")
+                + "。机器人不在那个群里，QQ 会报「非群成员」或「文件不存在」，"
+                  "所以取不到直链；但**你自己在群里点开那条转发就能下**。",
+                "",
+            ]
+        else:
+            lines += [
+                f"1. 打开群 **{group_id}**（{group_name}）",
+                f"2. 找 **{m.get('src_sender')}** 在 "
+                f"**{fmt_clock(m.get('src_time'))}** 发的消息",
+                "",
+            ]
+    lines += [
+        "---",
+        "",
+        "> 想以后自动下：把机器人拉进上面提到的来源群，再跑一次采集即可。",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", type=int, default=None, help="群号，默认取配置里第一个")
@@ -439,6 +522,7 @@ def main() -> int:
 
     # ---- 下载媒体
     media_files: list[Path] = []
+    missing: list[dict] = []
     if not args.no_media:
         print("\n[3/4] 下载群文件 / 图片（含合并转发内部的）")
         from qq2wx.media import MediaDownloader
@@ -456,8 +540,8 @@ def main() -> int:
         dl.media_dir.mkdir(parents=True, exist_ok=True)
 
         done: set = set()
-        no_url = 0
-        for seg_type, data, gid in iter_media_segments(msgs, group_id):
+        got_names: set = set()
+        for seg_type, data, gid, ctx in iter_media_segments(msgs, group_id):
             if not wanted.get(seg_type, False):
                 continue
             keys = []
@@ -472,23 +556,37 @@ def main() -> int:
             if keys and any(k in done for k in keys):
                 continue
 
-            item = build_media_item(http, seg_type, data, gid)
+            label = str(data.get("file") or data.get("name") or "?")
+            item, reason = build_media_item(http, seg_type, data, gid)
             if item is None:
                 # 不标记 done：同一个文件可能在顶层和转发里各有一份，
                 # 转发那份属于别的群取不到，顶层那份还是能下的。
-                no_url += 1
+                missing.append({"name": label, "kind": seg_type,
+                                "size": int(data.get("file_size") or 0),
+                                "file_id": str(data.get("file_id") or ""),
+                                "reason": reason, **ctx})
+                print(f"  [x] {label} → {reason}")
                 continue
+
             item = dl.download(item)
             done.update(keys)            # 同一个 id / 同名文件不用再试
             if item.ok:
                 media_files.append(Path(item.local_path))
+                got_names.add(label)
                 print(f"  ↓ {Path(item.local_path).name}"
                       f"  ({item.size / 1024:.0f} KB)")
             else:
-                print(f"  [x] {item.filename or item.url[:50]} 失败：{item.error}")
+                missing.append({"name": label, "kind": seg_type,
+                                "size": int(data.get("file_size") or 0),
+                                "file_id": str(data.get("file_id") or ""),
+                                "reason": f"下载失败：{item.error}", **ctx})
+                print(f"  [x] {label} → 下载失败：{item.error}")
             time.sleep(0.3)
+        # 同一个文件可能转发那份失败、顶层那份成功。已经拿到手的就不算"下不来"。
+        missing = [m for m in missing if m["name"] not in got_names]
         print(f"  → 成功 {len(media_files)} 个"
-              + (f"，{no_url} 个拿不到下载地址" if no_url else ""))
+              + (f"，{len(missing)} 个下不来（坐标写进 MISSING.md）"
+                 if missing else ""))
     else:
         print("\n[3/4] 跳过媒体下载（--no-media）")
 
@@ -503,6 +601,11 @@ def main() -> int:
     (out / "SUMMARY.md").write_text(
         render_summary(group_id, group_name, msgs, since, media_files),
         encoding="utf-8")
+
+    # 下不来的附件：写清楚"去哪下"，交给用户自己拿
+    if missing:
+        (out / "MISSING.md").write_text(
+            render_missing(group_id, group_name, missing), encoding="utf-8")
 
     # 记下增量位置，下次 --since-last 从这里接着走
     if msgs:
