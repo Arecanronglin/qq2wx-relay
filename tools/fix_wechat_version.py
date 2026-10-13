@@ -33,10 +33,24 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = Path(r"D:\wechat-4.1.8.28\WeChatWin_4.1.8.28.exe")
-# 微信会装到这两个目录之一，两个都要处理
-WECHAT_DIRS = [Path(r"D:\wechat418\Weixin"), Path(r"D:\wechat\Weixin")]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from qq2wx.wxpaths import default_wechat_dirs, find_installer  # noqa: E402
+
 TARGET_VERSION = "4.1.8.28"
+
+# 微信安装目录和安装包位置**运行时发现**，不写死在源码里。
+# 优先级：--wechat-dir / --installer 参数 > 环境变量 > 自动发现。
+WECHAT_DIRS: list[Path] = []
+INSTALLER: Path | None = None
+
+
+def configure(wechat_dirs=None, installer=None) -> None:
+    global WECHAT_DIRS, INSTALLER  # noqa: PLW0603
+    WECHAT_DIRS = ([Path(p) for p in wechat_dirs]
+                   if wechat_dirs else default_wechat_dirs())
+    INSTALLER = Path(installer) if installer else find_installer()
 
 
 # ------------------------------------------------------------------ 基础
@@ -213,8 +227,9 @@ def show_status() -> None:
 # ------------------------------------------------------------------ 安装
 
 def install_41828() -> int:
-    if not INSTALLER.exists():
-        print(f"[x] 找不到安装包：{INSTALLER}")
+    if INSTALLER is None or not INSTALLER.exists():
+        print("[x] 找不到微信安装包（WeChatWin*.exe）")
+        print("    用 --installer 指定，或设环境变量 WECHAT_INSTALLER")
         return 2
     if not is_admin():
         print("[x] 需要管理员权限才能静默安装")
@@ -304,7 +319,13 @@ def main() -> int:
     g.add_argument("--block", action="store_true", help="只封锁更新（不安装）")
     g.add_argument("--unblock", action="store_true", help="解除封锁，还原原始更新程序")
     g.add_argument("--status", action="store_true", help="只看状态")
+    ap.add_argument("--wechat-dir", action="append", metavar="DIR",
+                    help="微信安装目录（含 Weixin.exe），可重复；默认自动发现")
+    ap.add_argument("--installer", metavar="EXE",
+                    help="微信安装包路径，默认自动搜索")
     args = ap.parse_args()
+
+    configure(args.wechat_dir, args.installer)
 
     if args.install:
         return install_41828()

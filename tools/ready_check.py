@@ -61,9 +61,11 @@ def main() -> int:
         blocking.append("版本检查失败")
 
     # ---------------------------------------------------------- 更新封锁
+    from qq2wx.wxpaths import default_wechat_dirs
+
     locked = 0
     total_upd = 0
-    for base in (Path(r"D:\wechat418\Weixin"), Path(r"D:\wechat\Weixin")):
+    for base in default_wechat_dirs():
         if not base.exists():
             continue
         for vd in base.iterdir():

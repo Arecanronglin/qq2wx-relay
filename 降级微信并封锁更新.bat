@@ -31,13 +31,10 @@ if errorlevel 1 (
 echo [OK] Running as Administrator.
 echo.
 
-if not exist "D:\wechat-4.1.8.28\WeChatWin_4.1.8.28.exe" (
-    echo [ERROR] Installer not found:
-    echo         D:\wechat-4.1.8.28\WeChatWin_4.1.8.28.exe
-    echo.
-    pause
-    exit /b 1
-)
+rem The Python tool finds the installer by itself (registry + drive scan).
+rem If it cannot, pass it explicitly:
+rem     --installer "D:\path\to\WeChatWin_4.1.8.28.exe"
+rem or set the environment variable WECHAT_INSTALLER.
 
 echo This will:
 echo   1. close WeChat
