@@ -1,9 +1,12 @@
 # qq2wx-relay
 
-把 **QQ 群里指定群的消息** 截获、整合，再发到 **微信群**。
+把 QQ 群的消息截获、整合，发到微信群。
 
-- QQ 侧：[NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot 11 协议，正版 NTQQ 注入，同类里风控最低）
-- 微信侧：[wx4py](https://github.com/claw-codes/wx4py)（微信 4.x UI 自动化，不注入、不 hook、不碰数据库）
+- QQ 侧：[NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot 11，正版 NTQQ 注入）
+- 微信侧：[wx4py](https://github.com/claw-codes/wx4py)（微信 UI 自动化，不注入、不碰数据库）
+
+> ⚠️ **微信 4.1.13 及以上无法自动化 —— 这是微信客户端自身的限制，本项目绕不过。
+> 必须先降级到 4.1.8.28 并封锁它的自动更新。** 原因和实测证据见下一节。
 
 ```
 QQ 群消息 ──> NapCat ──OneBot 11──> qq2wx-relay ──> wx4py ──> 微信群
